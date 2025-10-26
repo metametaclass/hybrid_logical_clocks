@@ -1,0 +1,10 @@
+hlc_simulation_*.csv
+hlc_simulation_*.json
+*.tmp
+*.csv
+*.png
+*.log
+venv
+.venv
+__pycache__
+*.pyc
