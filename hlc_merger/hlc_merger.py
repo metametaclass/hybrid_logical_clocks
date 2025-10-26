@@ -37,18 +37,22 @@ class HLCMergerEvent:
 
 
 class MergerOutputEvent:
-    def __init__(self, hybrid_clock_l, source, event: HLCMergerEvent):
+    def __init__(self, hybrid_clock_l, source, event: HLCMergerEvent, time_koef_a: float, time_offset_b: float):
         self.source_id = source
         self.hybrid_clock_l = hybrid_clock_l
         self.event = event
+        self.time_koef_a = time_koef_a
+        self.time_offset_b = time_offset_b
 
     def __str__(self):
-        return f"MergerOutputEvent(source_id={self.source_id}, hybrid_clock_l={self.hybrid_clock_l}, event={self.event})"
+        return f"MergerOutputEvent(source_id={self.source_id}, hybrid_clock_l={self.hybrid_clock_l}, event={self.event} time_koef_a={self.time_koef_a}, time_offset_b={self.time_offset_b})"  # noqa E501
 
     def as_dict(self):
         result = {
             'source_id': self.source_id,
             'hybrid_clock_l': self.hybrid_clock_l,
+            'time_koef_a': self.time_koef_a,
+            'time_offset_b': self.time_offset_b,
         }
         result.update(self.event.as_dict())
         return result
@@ -60,7 +64,7 @@ class HLCMergerState:
         self.source_id = source_id
         self.time_koef_a = time_koef_a
         self.time_offset_b = time_offset_b
-        self.clock_l = -1.0
+        self.clock_l = -1e9
         self.clock_c = 0
         self.queue = deque()
 
@@ -69,6 +73,11 @@ class HLCMergerState:
         return self.time_koef_a * physical_time + self.time_offset_b
 
     def assign_clock(self, clock_l: float, clock_c: int):
+        """Assign new values to the hybrid logical clock."""
+        if clock_l < self.clock_l:
+            raise ValueError("New clock_l must be greater than or equal to current clock_l.")
+        if clock_l == self.clock_l and clock_c <= self.clock_c:
+            raise ValueError("If clock_l is unchanged, new clock_c must be greater than current clock_c.")
         self.clock_l = clock_l
         self.clock_c = clock_c
 
@@ -79,20 +88,32 @@ class HLCMerger():
         self.sources = sources
         # TODO: guest initial time offset
         self.states = {source.id: HLCMergerState(source.id) for source in sources}
+        # self.states["Client0"].time_offset_b = -1  # example offset for testing
         self.send_ids = {}
         self.min_heap = []
         self.EPSILON = 1e-6
 
-    def _push_heap(self, clock_l: float, clock_c: int, source: str, event: HLCMergerEvent):
+    def _push_heap(self, clock_l: float, clock_c: int, source: HLCMergerState, event: HLCMergerEvent):
         """Push an event onto the min-heap for merging.
         Args:
             clock_l (float): The hybrid physical clock part of the event.
             clock_c (int): The hybrid logical clock part of the event.
-            source (str): The source identifier of the event.
+            source (HLCMergerState): The source state of the merger
             local_event_idx (int): The local index of the event in its source.
             event (HLCMergerEvent): The event to be pushed onto the heap.
         """
-        heapq.heappush(self.min_heap, (clock_l, clock_c, source, event.local_index, event))
+        heapq.heappush(self.min_heap, (clock_l, clock_c, source.source_id, event.local_index, event,
+                                       source.time_koef_a, source.time_offset_b))
+
+    def _validate_queue(self, state: HLCMergerState):
+        """Validate that the events in the state's queue are in non-decreasing order of timestamps."""
+        print(f"Validating queue for source {state.source_id}:")
+        prev_timestamp = -1e12
+        for event in state.queue:
+            print(event.timestamp)
+            if event.timestamp < prev_timestamp:
+                print(f"Events in source {state.source_id} are not in non-decreasing order of timestamps.")
+            prev_timestamp = event.timestamp
 
     def get_next_event(self, source) -> typing.Tuple[HLCMergerState, typing.Optional[HLCMergerEvent]]:
         """Fetch the next event from the given source or its buffer."""
@@ -106,8 +127,10 @@ class HLCMerger():
         else:
             event = source.fetch()
             if event is not None:
+                # print(f"Fetched event from source {source.id}: {event}")
                 state.queue.append(event)
         # event is left/front element in the queue
+        # self._validate_queue(state)
         return state, event
 
     def low_watermark(self):
@@ -115,13 +138,15 @@ class HLCMerger():
         lw = None
         for source in self.sources:
             state, event = self.get_next_event(source)
-            if event is None:
-                continue
-            projected_time = state.project_time(event.timestamp)
+            # if event is None:
+            #     continue
+            # projected_time = state.project_time(event.timestamp)
+            # l_provisional = max(projected_time, state.clock_l)
+            l_provisional = state.clock_l
             if lw is None:
-                lw = projected_time
+                lw = l_provisional
             else:
-                lw = min(lw, projected_time)
+                lw = min(lw, l_provisional)
         return lw
 
     # def _get_key(heap_item):
@@ -159,8 +184,8 @@ class HLCMerger():
                 # TODO: use clearer logic for clock_c increment instead of clever `and` tricks
                 clock_c = (clock_l == argmin_state.clock_l) and (argmin_state.clock_c + 1) or 0
                 argmin_state.assign_clock(clock_l, clock_c)
-                self.send_ids[HLCMerger._send_ids_key(event)] = (argmin_state.clock_l, argmin_state.clock_c)
-                self._push_heap(clock_l, clock_c, argmin_state.source_id, event)
+                self.send_ids[HLCMerger._send_ids_key(event)] = (clock_l, clock_c)
+                self._push_heap(clock_l, clock_c, argmin_state, event)
             elif event.kind == HLCMergerKind.RECEIVE:
                 send_clock = self.send_ids.get(HLCMerger._send_ids_key(event), None)
                 if send_clock is None:
@@ -171,8 +196,12 @@ class HLCMerger():
                 projected_time = argmin_state.project_time(event.timestamp)
                 # discipline: enforce pr >= ls + eps by bumping b_i if needed
                 if projected_time < send_clock_l + self.EPSILON:
-                    argmin_state.time_offset_b += (send_clock_l + self.EPSILON - projected_time)  # / argmin_state.time_koef_a ?
+                    # use 2 * EPSILON to avoid floating point comparison issues
+                    argmin_state.time_offset_b += (send_clock_l + self.EPSILON*2 - projected_time)  # / argmin_state.time_koef_a ?
                     projected_time = argmin_state.project_time(event.timestamp)
+
+                if projected_time < send_clock_l + self.EPSILON:
+                    raise ValueError("Failed to adjust time offset to satisfy HLC receive condition.")
 
                 # Original HLC logic for reference: https://cse.buffalo.edu/tech-reports/2014-04.pdf
                 # pr = projected_time
@@ -198,12 +227,12 @@ class HLCMerger():
                     clock_c = 0
 
                 argmin_state.assign_clock(clock_l, clock_c)
-                self._push_heap(clock_l, clock_c, argmin_state.source_id, event)
+                self._push_heap(clock_l, clock_c, argmin_state, event)
             elif event.kind == HLCMergerKind.LOCAL:
                 clock_l = max(argmin_state.project_time(event.timestamp), argmin_state.clock_l)
                 clock_c = (clock_l == argmin_state.clock_l) and (argmin_state.clock_c + 1) or 0
                 argmin_state.assign_clock(clock_l, clock_c)
-                self._push_heap(clock_l, clock_c, argmin_state.source_id, event)
+                self._push_heap(clock_l, clock_c, argmin_state, event)
             else:
                 raise ValueError(f"Unknown event kind: {event.kind}")
 
@@ -212,5 +241,11 @@ class HLCMerger():
                 # print("HLCMerger: low watermark is None, return...")
                 continue
             while self.min_heap and (self.min_heap[0][0] <= lw):
-                clock, _, source, _, event = heapq.heappop(self.min_heap)
-                yield MergerOutputEvent(clock, source, event)
+                clock, _, source, _, event, koef_a, time_offset_b = heapq.heappop(self.min_heap)
+                yield MergerOutputEvent(clock, source, event, koef_a, time_offset_b)
+
+    def flush(self):
+        """Flush all remaining events in the merger."""
+        while self.min_heap:
+            clock, _, source, _, event, koef_a, time_offset_b = heapq.heappop(self.min_heap)
+            yield MergerOutputEvent(clock, source, event, koef_a, time_offset_b)

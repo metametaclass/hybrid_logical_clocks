@@ -6,6 +6,8 @@ import json
 import argparse
 from collections import deque
 
+from hlc_merger.hlc_merger import MergerOutputEvent
+
 
 class TimeSource:
     def __init__(self):
@@ -20,19 +22,19 @@ class NetworkChannelParams:
 
 
 class NetworkPacket:
-    def __init__(self, packet_id: int, source_node_id: str, timestamp: float):
+    def __init__(self, packet_id: int, sender_id: str, timestamp: float):
         self.packet_id = packet_id
-        self.source_node_id = source_node_id
-        self.timestamp = timestamp
+        self.sender_id = sender_id
+        self.sender_timestamp = timestamp
 
     def __str__(self):
-        return f"NetworkPacket(packet_id={self.packet_id}, source_node_id={self.source_node_id}, timestamp={self.timestamp})"
+        return f"NetworkPacket(packet_id={self.packet_id}, sender_id={self.sender_id}, sender_timestamp={self.sender_timestamp})"
 
     def as_dict(self):
         return {
             'packet_id': self.packet_id,
-            'source_node_id': self.source_node_id,
-            'timestamp': self.timestamp
+            'sender_id': self.sender_id,
+            'sender_timestamp': self.sender_timestamp
         }
 
 
@@ -56,6 +58,9 @@ class NetworkChannelEmulator:
             # drop packet
             return
         latency = self.params.base_latency_ms + self.random_gen.uniform(-self.params.jitter_ms, self.params.jitter_ms)
+        if latency < 0.0:
+            print("Warning: negative latency adjusted to zero")
+            latency = 0.0
         delivery_time = self.time_source.state + latency / 1000.0
         self.scheduled_packets.append((delivery_time, packet))
 
@@ -165,7 +170,8 @@ class Node:
         self.random_gen = random_gen
         self.scheduler_params = scheduler_params
         self.target_time = scheduler_params.start_offset
-        self.channels: typing.List[NetworkChannelEmulator] = []
+        self.send_channels: typing.List[NetworkChannelEmulator] = []
+        self.receiver_channels: typing.List[NetworkChannelEmulator] = []
         self.packet_id = 0
         self.event_counter = 0
         self.frame_counter = 0
@@ -183,39 +189,45 @@ class Node:
         else:
             return 2
 
-    def create_event(self, event_kind: TraceEventKind, data: typing.Any):
+    def create_event(self, event_kind: TraceEventKind, event_timestamp: float, data: typing.Any):
         self.event_counter += 1
-        return TraceEvent(event_kind, self.node_id, self.event_counter, self.frame_counter, self.time_source.state, data)
+        return TraceEvent(event_kind, self.node_id, self.event_counter, self.frame_counter, event_timestamp, data)
 
     def tick(self, is_stopping: bool) -> typing.Generator[TraceEvent, None, None]:
         # skip ticks until time source reaches scheduled target time
         if self.target_time > self.time_source.state:
-            return
+            return []
 
         # receive network packets
-        for channel in self.channels:
+        for channel in self.receiver_channels:
             # channel used world time source to simulate network delay
             for network_packet in channel.recv():
-                yield self.create_event(TraceEventKind.NetworkPacketReceived, network_packet)
+                yield self.create_event(TraceEventKind.NetworkPacketReceived, self.time_source.state, network_packet)
 
         delta_seconds, real_delta_seconds = self.scheduler_params.get_delta_seconds(self.random_gen)
+        if delta_seconds <= 0.0 or real_delta_seconds <= 0.0:
+            raise ValueError("Delta seconds must be positive")
 
-        self.event_counter += 1
-        yield self.create_event(TraceEventKind.FrameTick, FrameTickData(self.frame_counter, delta_seconds, real_delta_seconds))
+        yield self.create_event(TraceEventKind.FrameTick, self.time_source.state + delta_seconds * 0.1,
+                                FrameTickData(self.frame_counter, delta_seconds, real_delta_seconds))
 
         start_tick_time = self.time_source.state
         end_tick_time = start_tick_time + delta_seconds
 
         # stop sending packets if simulation is stopping
         if not is_stopping:
-            for channel in self.channels:
+            packet_send_idx = 0
+            packet_send_time = end_tick_time - delta_seconds * 0.1
+            for channel in self.send_channels:
                 packet_count = self.get_packet_count()
                 for i in range(packet_count):
                     self.packet_id += 1
                     # use small offset to differentiate multiple packets sent in the same tick
-                    packet = NetworkPacket(self.packet_id, self.node_id, end_tick_time + i * 0.0001)
+                    sent_time = packet_send_time + packet_send_idx * 0.0001
+                    packet_send_idx += 1
+                    packet = NetworkPacket(self.packet_id, self.node_id, sent_time)
                     channel.send(packet)
-                    yield self.create_event(TraceEventKind.NetworkPacketSent, packet)
+                    yield self.create_event(TraceEventKind.NetworkPacketSent, sent_time, packet)
 
         # simulate tick rate scheduler
         self.target_time = start_tick_time + real_delta_seconds
@@ -250,16 +262,6 @@ class QueueSource:
         else:
             raise ValueError(f"Unknown TraceEventKind: {event.kind}")
 
-    # def __iter__(self):
-    #     while self.queue:
-    #         event: TraceEvent = self.queue.popleft()
-    #         if self.last_event_timestamp is not None:
-    #             if event.timestamp < self.last_event_timestamp:
-    #                 print(f"Node {self.node_id} event timestamp decreased: "
-    #                       f"last={self.last_event_timestamp}, current={event.timestamp}")
-    #         self.last_event_timestamp = event.timestamp
-    #         yield HLCMergerEvent(event.timestamp, self.EventKindToHLCMergerKind(event), self.local_index, event)
-    #         self.local_index += 1
     def fetch(self) -> typing.Optional[HLCMergerEvent]:
         if not self.queue:
             return None
@@ -267,12 +269,13 @@ class QueueSource:
         if self.last_event_timestamp is not None:
             if event.timestamp < self.last_event_timestamp:
                 print(f"Node {self.id} event timestamp decreased: "
-                      f"last={self.last_event_timestamp}, current={event.timestamp}")
+                      f"last={self.last_event_timestamp}, current={event.timestamp}, "
+                      f"event={event}")
         self.last_event_timestamp = event.timestamp
         kind = self.EventKindToHLCMergerKind(event)
         if kind == HLCMergerKind.SEND or kind == HLCMergerKind.RECEIVE:
             message_id = event.data.packet_id
-            sender = event.data.source_node_id
+            sender = event.data.sender_id
         else:
             message_id = None
             sender = event.node_id
@@ -307,7 +310,8 @@ class Simulation:
 
     def link_nodes(self, sender: Node, receiver: Node, params: NetworkChannelParams):
         channel = NetworkChannelEmulator(self.random, sender, receiver, params)
-        sender.channels.append(channel)
+        sender.send_channels.append(channel)
+        receiver.receiver_channels.append(channel)
         self.network_channels.append(channel)
         self.tickers = self.nodes + self.network_channels
 
@@ -317,24 +321,28 @@ class Simulation:
                 return True
         return False
 
-    def handle_merged_events(self):
+    def _handle_merged_event(self, event: MergerOutputEvent):
+        if self.previous_hybrid_clock is not None:
+            if event.hybrid_clock_l < self.previous_hybrid_clock:
+                print(f"Merged event timestamp decreased: "
+                      f"last={self.previous_hybrid_clock}, current={event.hybrid_clock_l} "
+                      f"event={event}")
+                self.has_causality_violation = True
+        self.previous_hybrid_clock = event.hybrid_clock_l
+        self.merged_events.append(event)
+
+    def handle_merged_events(self, flush: bool = False):
         for output_event in self.hlc_merger.step():
-            # print(f"Merged event: {output_event}")
-            if self.previous_hybrid_clock is not None:
-                if output_event.hybrid_clock_l < self.previous_hybrid_clock:
-                    print(f"Merged event timestamp decreased: "
-                          f"last={self.previous_hybrid_clock}, current={output_event.hybrid_clock_l} "
-                          f"event={output_event}")
-                    self.has_causality_violation = True
-            self.previous_hybrid_clock = output_event.hybrid_clock_l
-            self.merged_events.append(output_event)
+            self._handle_merged_event(output_event)
+        if flush:
+            # finish processing remaining events
+            for output_event in self.hlc_merger.flush():
+                self._handle_merged_event(output_event)
 
     def run(self):
         self.hlc_merger = HLCMerger([QueueSource(node.node_id, node.event_queue) for node in self.nodes])
         while self.main_time_source.state < self.duration or self.has_pending_tickers():
-            if self.verbose:
-                print(f"Simulation time: {self.main_time_source.state:.6f}s")
-
+            # determine minimum remaining time to next tick
             min_remaining_time = self.forced_delta_seconds
             for node in self.nodes:
                 remaining_time = node.get_remaining_time()
@@ -342,12 +350,12 @@ class Simulation:
                     min_remaining_time = remaining_time
 
             if self.verbose:
-                print(f" Advancing time by {min_remaining_time:.6f}s")
+                print(f"Simulation time {self.main_time_source.state:.6f}s advancing by {min_remaining_time:.6f}s")
             for ticker in self.tickers:
                 # advance each ticker time source with some random variation
                 # we want to simulate that each ticker may run slightly faster or slower
-                ticker.time_source.state += min_remaining_time * self.random.uniform(self.main_tick_slow_correction_koeff,
-                                                                                     self.main_tick_fast_correction_koeff)
+                ticker.time_source.state += min_remaining_time * self.random.uniform(self.main_tick_fast_correction_koeff,
+                                                                                     self.main_tick_slow_correction_koeff)
 
             is_stopping = self.main_time_source.state >= self.duration
 
@@ -365,7 +373,7 @@ class Simulation:
                 break
 
         # process remaining merged events
-        self.handle_merged_events
+        self.handle_merged_events(True)
 
 
 def main():
@@ -441,8 +449,10 @@ def main():
     for node in simulation.nodes:
         print(f"Node {node.node_id} statistics:")
         print(f" Time:{node.time_source.state:.6f} Total events: {node.event_counter}, Total frames: {node.frame_counter}")
-        for channel in node.channels:
+        for channel in node.send_channels:
             print(f" Channel to {channel.receiver.node_id} statistics: {channel.get_channel_stats()}")
+        for channel in node.receiver_channels:
+            print(f" Channel from {channel.sender.node_id} statistics: {channel.get_channel_stats()}")
 
     if simulation.has_causality_violation:
         raise RuntimeError("Causality violation detected in merged events!")
