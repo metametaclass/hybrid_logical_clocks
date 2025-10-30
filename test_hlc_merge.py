@@ -246,8 +246,8 @@ class Node:
 
 class QueueSource:
     """Wrapper to use a deque as a source for HLCMerger and validate order."""
-    def __init__(self, id: str, queue: typing.Deque[TraceEvent]):
-        self.id = id
+    def __init__(self, source_id: str, queue: typing.Deque[TraceEvent]):
+        self.source_id = source_id
         self.queue = queue
         self.last_event_timestamp = None
         self.local_index = 0

@@ -22,7 +22,10 @@ class HLCMergerEvent:
         self.data = data
 
     def __str__(self):
-        return f"HLCMergerEvent(timestamp={self.timestamp}, kind={self.kind}, sender={self.sender}, message_id={self.message_id} data={self.data})"  # noqa E501
+        return (
+            f"HLCMergerEvent(timestamp={self.timestamp}, kind={self.kind}, "
+            f"sender={self.sender}, message_id={self.message_id} data={self.data})"
+            )
 
     def as_dict(self):
         result = {
@@ -45,7 +48,10 @@ class MergerOutputEvent:
         self.time_offset_b = time_offset_b
 
     def __str__(self):
-        return f"MergerOutputEvent(source_id={self.source_id}, hybrid_clock_l={self.hybrid_clock_l}, event={self.event} time_koef_a={self.time_koef_a}, time_offset_b={self.time_offset_b})"  # noqa E501
+        return (
+            f"MergerOutputEvent(source_id={self.source_id}, hybrid_clock_l={self.hybrid_clock_l}, "
+            f"event={self.event} time_koef_a={self.time_koef_a}, time_offset_b={self.time_offset_b})"
+        )
 
     def as_dict(self):
         result = {
@@ -87,7 +93,7 @@ class HLCMerger():
     def __init__(self, sources):
         self.sources = sources
         # TODO: guest initial time offset
-        self.states = {source.id: HLCMergerState(source.id) for source in sources}
+        self.states = {source.source_id: HLCMergerState(source.source_id) for source in sources}
         # self.states["Client0"].time_offset_b = -1  # example offset for testing
         self.send_ids = {}
         self.min_heap = []
@@ -117,9 +123,9 @@ class HLCMerger():
 
     def get_next_event(self, source) -> typing.Tuple[HLCMergerState, typing.Optional[HLCMergerEvent]]:
         """Fetch the next event from the given source or its buffer."""
-        state = self.states.get(source.id, None)
+        state = self.states.get(source.source_id, None)
         if state is None:
-            raise ValueError(f"Unknown source id: {source.id}")
+            raise ValueError(f"Unknown source id: {source.source_id}")
         event = None
         if state.queue:
             # peek at the next event
@@ -127,9 +133,11 @@ class HLCMerger():
         else:
             event = source.fetch()
             if event is not None:
-                # print(f"Fetched event from source {source.id}: {event}")
+                # print(f"Fetched event from source {source.source_id}: {event}")
                 state.queue.append(event)
         # event is left/front element in the queue
+
+        # optional validation of queue order
         # self._validate_queue(state)
         return state, event
 
@@ -148,11 +156,6 @@ class HLCMerger():
             else:
                 lw = min(lw, l_provisional)
         return lw
-
-    # def _get_key(heap_item):
-    #     """Extract the unique key from a heap item."""
-    #     clock_l, clock_c, source, local_index, _ = heap_item
-    #     return (clock_l, clock_c, source, local_index)
 
     def _send_ids_key(event):
         """Extract the unique key for send_ids dictionary."""
